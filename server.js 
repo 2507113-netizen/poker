@@ -1,0 +1,342 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// 정적 파일(HTML, CSS, JS) 제공
+app.use(express.static(path.join(__dirname, 'public')));
+
+// --- [게임 상태 관리] ---
+const MAX_PLAYERS = 6;
+let players = {}; 
+let playerIds = []; 
+let table = {
+    state: 'WAITING', // WAITING, PREFLOP, FLOP, TURN, RIVER, SHOWDOWN
+    pot: 0,
+    currentBet: 0,
+    communityCards: [],
+    deck: [],
+    dealerIndex: 0,
+    turnIndex: -1,
+    minBet: 20, 
+    logs: []
+};
+
+// --- [유틸리티 함수] ---
+const suits = ['♠', '♥', '♦', '♣'];
+const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+
+function createDeck() {
+    let deck = [];
+    for (let s of suits) {
+        for (let i = 0; i < ranks.length; i++) {
+            deck.push({ suit: s, rank: ranks[i], value: i + 2 });
+        }
+    }
+    // Fisher-Yates 셔플
+    for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    return deck;
+}
+
+function addLog(msg) {
+    table.logs.push(msg);
+    if (table.logs.length > 50) table.logs.shift(); // 로그 최대 50줄 유지
+    io.emit('gameLog', msg);
+}
+
+function broadcastState() {
+    for (let id in players) {
+        const playerState = {
+            ...table,
+            players: playerIds.map(pid => {
+                const p = players[pid];
+                return {
+                    id: p.id,
+                    name: p.name,
+                    chips: p.chips,
+                    currentBet: p.currentBet,
+                    folded: p.folded,
+                    isActive: p.isActive,
+                    // 본인이거나 쇼다운 상태일 때만 카드 앞면 공개
+                    cards: (pid === id || table.state === 'SHOWDOWN') ? p.cards : (p.cards.length > 0 ? ['hidden', 'hidden'] : [])
+                };
+            }),
+            myId: id,
+            isMyTurn: playerIds[table.turnIndex] === id
+        };
+        io.to(id).emit('gameState', playerState);
+    }
+}
+
+// --- [게임 플로우 로직] ---
+function startGame() {
+    if (playerIds.length < 2) return;
+    
+    table.state = 'PREFLOP';
+    table.pot = 0;
+    table.currentBet = table.minBet;
+    table.communityCards = [];
+    table.deck = createDeck();
+    
+    // 블라인드 설정
+    table.dealerIndex = (table.dealerIndex + 1) % playerIds.length;
+    let sbIndex = (table.dealerIndex + 1) % playerIds.length;
+    let bbIndex = (table.dealerIndex + 2) % playerIds.length;
+    table.turnIndex = (table.dealerIndex + 3) % playerIds.length;
+
+    playerIds.forEach(id => {
+        players[id].cards = [table.deck.pop(), table.deck.pop()];
+        players[id].currentBet = 0;
+        players[id].folded = false;
+        players[id].isActive = true;
+    });
+
+    bet(playerIds[sbIndex], table.minBet / 2); // Small Blind
+    bet(playerIds[bbIndex], table.minBet);     // Big Blind
+
+    addLog('--- 🃏 새로운 게임이 시작되었습니다 ---');
+    broadcastState();
+}
+
+function bet(id, amount) {
+    const p = players[id];
+    let actualBet = Math.min(amount, p.chips); // 올인 방어
+    p.chips -= actualBet;
+    p.currentBet += actualBet;
+    table.pot += actualBet;
+}
+
+function nextTurn() {
+    const activePlayers = playerIds.filter(id => !players[id].folded && players[id].chips >= 0);
+    const unFoldedPlayers = playerIds.filter(id => !players[id].folded);
+    
+    // 생존자가 1명이면 즉시 승리
+    if (unFoldedPlayers.length === 1) {
+        handleWinner([players[unFoldedPlayers[0]]]);
+        return;
+    }
+
+    // 모든 플레이어가 베팅을 맞췄는지 확인
+    const allMatched = activePlayers.every(id => players[id].currentBet === table.currentBet || players[id].chips === 0);
+    
+    if (allMatched && table.currentBet >= 0) {
+        advanceStage();
+    } else {
+        do {
+            table.turnIndex = (table.turnIndex + 1) % playerIds.length;
+        } while (players[playerIds[table.turnIndex]].folded || players[playerIds[table.turnIndex]].chips === 0);
+        broadcastState();
+    }
+}
+
+function advanceStage() {
+    playerIds.forEach(id => { players[id].currentBet = 0; });
+    table.currentBet = 0;
+
+    if (table.state === 'PREFLOP') {
+        table.state = 'FLOP';
+        table.communityCards.push(table.deck.pop(), table.deck.pop(), table.deck.pop());
+        addLog('🎴 플랍(Flop) 카드가 공개되었습니다.');
+    } else if (table.state === 'FLOP') {
+        table.state = 'TURN';
+        table.communityCards.push(table.deck.pop());
+        addLog('🎴 턴(Turn) 카드가 공개되었습니다.');
+    } else if (table.state === 'TURN') {
+        table.state = 'RIVER';
+        table.communityCards.push(table.deck.pop());
+        addLog('🎴 리버(River) 카드가 공개되었습니다.');
+    } else {
+        table.state = 'SHOWDOWN';
+        evaluateShowdown();
+        return;
+    }
+
+    // 다음 턴은 딜러 다음 사람부터
+    table.turnIndex = table.dealerIndex;
+    do {
+        table.turnIndex = (table.turnIndex + 1) % playerIds.length;
+    } while (players[playerIds[table.turnIndex]].folded || players[playerIds[table.turnIndex]].chips === 0);
+
+    broadcastState();
+}
+
+// --- [족보 판별 (텍사스 홀덤 7장 중 5장)] ---
+function getCombinations(arr, size) {
+    if (size === 1) return arr.map(el => [el]);
+    let result = [];
+    arr.forEach((current, index) => {
+        let smallerCombos = getCombinations(arr.slice(index + 1), size - 1);
+        smallerCombos.forEach(combo => result.push([current].concat(combo)));
+    });
+    return result;
+}
+
+function getHandRank(cards) {
+    const combos = getCombinations(cards, 5);
+    let bestScore = -1;
+    let bestHandName = '';
+
+    for (let combo of combos) {
+        combo.sort((a, b) => b.value - a.value);
+        let values = combo.map(c => c.value);
+        let suitsList = combo.map(c => c.suit);
+        
+        let isFlush = suitsList.every(s => s === suitsList[0]);
+        let isStraight = values[0] - values[4] === 4 && new Set(values).size === 5;
+        
+        // 백스트레이트 예외 (A, 5, 4, 3, 2)
+        if (values[0] === 14 && values[1] === 5 && values[2] === 4 && values[3] === 3 && values[4] === 2) {
+            isStraight = true;
+            values = [5, 4, 3, 2, 1];
+        }
+
+        let counts = {};
+        values.forEach(v => counts[v] = (counts[v] || 0) + 1);
+        let freqs = Object.entries(counts).sort((a, b) => b[1] - a[1] || b[0] - a[0]);
+
+        let rank = 0; let name = "High Card";
+        if (isFlush && isStraight) { rank = 8; name = "Straight Flush"; }
+        else if (freqs[0][1] === 4) { rank = 7; name = "Four of a Kind"; }
+        else if (freqs[0][1] === 3 && freqs[1][1] === 2) { rank = 6; name = "Full House"; }
+        else if (isFlush) { rank = 5; name = "Flush"; }
+        else if (isStraight) { rank = 4; name = "Straight"; }
+        else if (freqs[0][1] === 3) { rank = 3; name = "Three of a Kind"; }
+        else if (freqs[0][1] === 2 && freqs[1][1] === 2) { rank = 2; name = "Two Pair"; }
+        else if (freqs[0][1] === 2) { rank = 1; name = "One Pair"; }
+
+        let score = (rank << 20) + (parseInt(freqs[0][0]) << 16) + 
+                    (parseInt(freqs[1] ? freqs[1][0] : 0) << 12) + 
+                    (parseInt(freqs[2] ? freqs[2][0] : 0) << 8) + 
+                    (parseInt(freqs[3] ? freqs[3][0] : 0) << 4) + 
+                    (parseInt(freqs[4] ? freqs[4][0] : 0));
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestHandName = name;
+        }
+    }
+    return { score: bestScore, name: bestHandName };
+}
+
+function evaluateShowdown() {
+    let activePlayers = playerIds.filter(id => !players[id].folded).map(id => players[id]);
+    
+    activePlayers.forEach(p => {
+        let fullHand = p.cards.concat(table.communityCards);
+        p.handEval = getHandRank(fullHand);
+        addLog(`[쇼다운] ${p.name}: ${p.handEval.name}`);
+    });
+
+    activePlayers.sort((a, b) => b.handEval.score - a.handEval.score);
+    
+    let winners = [activePlayers[0]];
+    for (let i = 1; i < activePlayers.length; i++) {
+        if (activePlayers[i].handEval.score === winners[0].handEval.score) winners.push(activePlayers[i]);
+        else break;
+    }
+
+    handleWinner(winners);
+}
+
+function handleWinner(winners) {
+    let winAmount = Math.floor(table.pot / winners.length);
+    let winNames = winners.map(w => w.name).join(', ');
+    
+    winners.forEach(w => w.chips += winAmount);
+    addLog(`🏆 승리자: ${winNames} ($${winAmount} 획득)`);
+    
+    table.state = 'SHOWDOWN';
+    broadcastState();
+
+    // 5초 후 새 게임 시작
+    setTimeout(() => {
+        if (playerIds.length >= 2) startGame();
+        else {
+            table.state = 'WAITING';
+            broadcastState();
+        }
+    }, 5000);
+}
+
+// --- [Socket.io 통신] ---
+io.on('connection', (socket) => {
+    if (playerIds.length >= MAX_PLAYERS) {
+        socket.emit('gameLog', '테이블이 꽉 찼습니다. 관전 모드로 입장합니다.');
+        return;
+    }
+
+    players[socket.id] = {
+        id: socket.id,
+        name: `Player ${Math.floor(Math.random() * 1000)}`,
+        chips: 1000,
+        currentBet: 0,
+        cards: [],
+        folded: false,
+        isActive: false
+    };
+    playerIds.push(socket.id);
+    addLog(`👋 ${players[socket.id].name} 접속했습니다.`);
+
+    if (table.state === 'WAITING' && playerIds.length >= 2) startGame();
+    else broadcastState();
+
+    socket.on('action', (actionData) => {
+        if (playerIds[table.turnIndex] !== socket.id) return; 
+
+        let p = players[socket.id];
+        const toCall = table.currentBet - p.currentBet;
+
+        if (actionData.type === 'fold') {
+            p.folded = true;
+            addLog(`🏳️ ${p.name} Fold`);
+        } else if (actionData.type === 'call' || actionData.type === 'check') {
+            if (toCall > 0) {
+                bet(socket.id, toCall);
+                addLog(`💵 ${p.name} Call ($${toCall})`);
+            } else {
+                addLog(`✔️ ${p.name} Check`);
+            }
+        } else if (actionData.type === 'raise') {
+            let raiseAmount = parseInt(actionData.amount);
+            if (raiseAmount >= toCall + table.minBet && raiseAmount <= p.chips + p.currentBet) {
+                let addAmount = raiseAmount - p.currentBet;
+                bet(socket.id, addAmount);
+                table.currentBet = p.currentBet;
+                addLog(`🔥 ${p.name} Raise to $${table.currentBet}`);
+            } else return; 
+        }
+
+        nextTurn();
+    });
+
+    socket.on('disconnect', () => {
+        let pName = players[socket.id]?.name;
+        if(pName) addLog(`🚪 ${pName} 퇴장했습니다.`);
+        
+        let wasMyTurn = (playerIds[table.turnIndex] === socket.id);
+        
+        if (players[socket.id]) players[socket.id].folded = true;
+        playerIds = playerIds.filter(id => id !== socket.id);
+        delete players[socket.id];
+        
+        if (wasMyTurn && table.state !== 'WAITING') nextTurn();
+        
+        if (playerIds.length < 2 && table.state !== 'WAITING') {
+            table.state = 'WAITING';
+            addLog('플레이어 부족으로 대기열로 돌아갑니다.');
+            broadcastState();
+        }
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+});
