@@ -1,1 +1,248 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multiplayer Texas Hold'em</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --table-green: #116530;
+            --table-border: #3E2723;
+            --highlight: #FFD700;
+            --text-light: #E0E0E0;
+        }
+        body {
+            margin: 0; padding: 0; background-color: var(--bg-color); color: var(--text-light);
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            display: flex; height: 100vh; overflow: hidden;
+            flex-direction: row;
+        }
+        /* 메인 게임 영역 */
+        #game-area {
+            flex: 3; display: flex; flex-direction: column; position: relative;
+        }
+        #table-wrapper {
+            flex: 1; display: flex; align-items: center; justify-content: center; padding: 20px;
+        }
+        #table {
+            background: radial-gradient(circle, #1B8340 0%, var(--table-green) 100%);
+            border: 15px solid var(--table-border);
+            border-radius: 150px;
+            width: 90%; max-width: 900px; height: 70%; max-height: 500px;
+            position: relative;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.8), inset 0 0 40px rgba(0,0,0,0.5);
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .pot-info {
+            background: rgba(0,0,0,0.7); padding: 12px 25px; border-radius: 30px;
+            font-size: 1.8rem; font-weight: bold; margin-bottom: 20px; color: var(--highlight);
+            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+        }
+        .community-cards { display: flex; gap: 10px; height: 100px; }
+        
+        /* 카드 디자인 */
+        .card {
+            width: 65px; height: 95px; background: white; border-radius: 8px;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            font-size: 1.8rem; font-weight: bold; border: 1px solid #ccc;
+            box-shadow: 2px 4px 8px rgba(0,0,0,0.4);
+        }
+        .card.red { color: #D32F2F; }
+        .card.black { color: #212121; }
+        .card.hidden {
+            background: repeating-linear-gradient(45deg, #0d47a1, #0d47a1 10px, #1976d2 10px, #1976d2 20px);
+            border: 2px solid white; color: transparent;
+        }
 
+        /* 플레이어 좌석 (6인 기준 하드코딩 배치) */
+        .seat {
+            position: absolute; background: rgba(0,0,0,0.85);
+            padding: 12px; border-radius: 12px; text-align: center; width: 130px;
+            border: 2px solid transparent; transition: all 0.3s;
+        }
+        .seat.active-turn { border-color: var(--highlight); box-shadow: 0 0 20px var(--highlight); transform: scale(1.05); }
+        .seat.folded { opacity: 0.4; }
+        .seat .name { font-weight: bold; font-size: 1rem; color: #fff; margin-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+        .seat .chips { color: #81C784; font-size: 0.95rem; }
+        .seat .bet { color: #FFF176; font-size: 0.85rem; margin-top: 5px; }
+        .seat .hole-cards { display: flex; gap: 5px; justify-content: center; margin-top: 8px; transform: scale(0.65); transform-origin: top; height: 60px;}
+
+        /* 좌석 위치 */
+        .seat-0 { bottom: -40px; left: 50%; transform: translateX(-50%); z-index: 10; } /* 내 자리 */
+        .seat-0.active-turn { transform: translateX(-50%) scale(1.05); }
+        .seat-1 { bottom: 10%; left: -60px; }
+        .seat-2 { top: 10%; left: -60px; }
+        .seat-3 { top: -40px; left: 50%; transform: translateX(-50%); }
+        .seat-4 { top: 10%; right: -60px; }
+        .seat-5 { bottom: 10%; right: -60px; }
+
+        /* 하단 컨트롤 패널 */
+        #controls {
+            background: #1A1A1A; padding: 25px; display: flex; justify-content: center; gap: 20px; align-items: center;
+            border-top: 2px solid #333; box-shadow: 0 -5px 15px rgba(0,0,0,0.5); z-index: 20;
+        }
+        button {
+            padding: 12px 25px; font-size: 1.2rem; cursor: pointer; border: none; border-radius: 8px; font-weight: bold; 
+            transition: 0.2s; text-transform: uppercase; letter-spacing: 1px;
+        }
+        button:disabled { opacity: 0.3; cursor: not-allowed; }
+        button:not(:disabled):active { transform: translateY(2px); }
+        #btn-fold { background: #D32F2F; color: white; }
+        #btn-check-call { background: #1976D2; color: white; }
+        #btn-raise { background: #388E3C; color: white; }
+        .slider-container { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+        #raise-slider { width: 180px; cursor: pointer; }
+
+        /* 우측 로그 패널 */
+        #log-area {
+            flex: 1; min-width: 250px; max-width: 350px; background: #0A0A0A; border-left: 2px solid #222; 
+            display: flex; flex-direction: column;
+        }
+        .log-header { background: #111; padding: 20px; text-align: center; font-weight: bold; font-size: 1.3rem; border-bottom: 1px solid #333; }
+        #logs { flex: 1; padding: 15px; overflow-y: auto; font-size: 0.95rem; display: flex; flex-direction: column; gap: 10px; }
+        .log-msg { border-bottom: 1px solid #222; padding-bottom: 8px; line-height: 1.4; color: #BBB; }
+
+        @media (max-width: 800px) {
+            body { flex-direction: column; }
+            #log-area { flex: none; height: 150px; border-left: none; border-top: 2px solid #222; max-width: none; }
+            #table { border-radius: 100px; }
+            .seat { transform: scale(0.8); }
+        }
+    </style>
+</head>
+<body>
+
+    <div id="game-area">
+        <div id="table-wrapper">
+            <div id="table">
+                <div class="pot-info">POT: $<span id="pot-amount">0</span></div>
+                <div class="community-cards" id="community-cards"></div>
+                <div id="seats-container"></div>
+            </div>
+        </div>
+
+        <div id="controls">
+            <button id="btn-fold" disabled>Fold</button>
+            <button id="btn-check-call" disabled>Check</button>
+            <div class="slider-container">
+                <button id="btn-raise" disabled>Raise $<span id="raise-val">0</span></button>
+                <input type="range" id="raise-slider" disabled min="0" max="1000" step="10">
+            </div>
+        </div>
+    </div>
+
+    <div id="log-area">
+        <div class="log-header">Game Logs 🃏</div>
+        <div id="logs"></div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io(); // 같은 도메인으로 자동 연결
+
+        // DOM Elements
+        const potAmountEl = document.getElementById('pot-amount');
+        const communityCardsEl = document.getElementById('community-cards');
+        const seatsContainerEl = document.getElementById('seats-container');
+        const logsEl = document.getElementById('logs');
+        
+        const btnFold = document.getElementById('btn-fold');
+        const btnCheckCall = document.getElementById('btn-check-call');
+        const btnRaise = document.getElementById('btn-raise');
+        const raiseSlider = document.getElementById('raise-slider');
+        const raiseValEl = document.getElementById('raise-val');
+
+        let myCurrentState = null;
+
+        function createCardHTML(card) {
+            if (card === 'hidden') return `<div class="card hidden"></div>`;
+            const colorClass = (card.suit === '♥' || card.suit === '♦') ? 'red' : 'black';
+            return `<div class="card ${colorClass}">
+                        <div>${card.rank}</div>
+                        <div>${card.suit}</div>
+                    </div>`;
+        }
+
+        function renderLogs(msg) {
+            const div = document.createElement('div');
+            div.className = 'log-msg';
+            div.innerText = msg;
+            logsEl.appendChild(div);
+            logsEl.scrollTop = logsEl.scrollHeight; // 자동 스크롤
+        }
+
+        socket.on('gameLog', (msg) => renderLogs(msg));
+
+        socket.on('gameState', (state) => {
+            myCurrentState = state;
+            potAmountEl.innerText = state.pot;
+            communityCardsEl.innerHTML = state.communityCards.map(c => createCardHTML(c)).join('');
+
+            seatsContainerEl.innerHTML = '';
+            const myIndex = state.players.findIndex(p => p.id === state.myId);
+            
+            state.players.forEach((p, idx) => {
+                // 내 위치를 항상 화면 하단(0번 좌석)에 고정
+                let seatPos = myIndex !== -1 ? (idx - myIndex + state.players.length) % state.players.length : idx;
+                
+                const isTurn = state.players[state.turnIndex]?.id === p.id;
+                const turnClass = isTurn ? 'active-turn' : '';
+                const foldClass = p.folded ? 'folded' : '';
+                let cardsHtml = p.cards ? p.cards.map(c => createCardHTML(c)).join('') : '';
+
+                const seatHtml = `
+                    <div class="seat seat-${seatPos} ${turnClass} ${foldClass}">
+                        <div class="name">${p.id === state.myId ? '(Me) ' : ''}${p.name}</div>
+                        <div class="chips">💰 $${p.chips}</div>
+                        <div class="bet">Bet: $${p.currentBet}</div>
+                        <div class="hole-cards">${cardsHtml}</div>
+                    </div>
+                `;
+                seatsContainerEl.innerHTML += seatHtml;
+            });
+
+            updateControls(state);
+        });
+
+        function updateControls(state) {
+            if (!state.isMyTurn || state.state === 'WAITING' || state.state === 'SHOWDOWN') {
+                btnFold.disabled = true; btnCheckCall.disabled = true; 
+                btnRaise.disabled = true; raiseSlider.disabled = true;
+                return;
+            }
+
+            const me = state.players.find(p => p.id === state.myId);
+            const toCall = state.currentBet - me.currentBet;
+
+            btnFold.disabled = false;
+            btnCheckCall.disabled = false;
+            btnCheckCall.innerText = toCall > 0 ? `Call $${toCall}` : `Check`;
+
+            const minRaise = state.currentBet + state.minBet;
+            if (me.chips + me.currentBet >= minRaise) {
+                btnRaise.disabled = false;
+                raiseSlider.disabled = false;
+                raiseSlider.min = minRaise;
+                raiseSlider.max = me.chips + me.currentBet;
+                raiseSlider.value = minRaise;
+                raiseValEl.innerText = raiseSlider.value;
+            } else {
+                btnRaise.disabled = true;
+                raiseSlider.disabled = true;
+            }
+        }
+
+        // Event Listeners
+        raiseSlider.addEventListener('input', (e) => raiseValEl.innerText = e.target.value);
+        btnFold.addEventListener('click', () => socket.emit('action', { type: 'fold' }));
+        btnCheckCall.addEventListener('click', () => {
+            const me = myCurrentState.players.find(p => p.id === myCurrentState.myId);
+            const toCall = myCurrentState.currentBet - me.currentBet;
+            socket.emit('action', { type: toCall > 0 ? 'call' : 'check' });
+        });
+        btnRaise.addEventListener('click', () => socket.emit('action', { type: 'raise', amount: raiseSlider.value }));
+
+    </script>
+</body>
+</html>
